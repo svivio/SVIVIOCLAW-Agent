@@ -399,27 +399,21 @@ class GUIOCApp(tk.Tk):
                           highlightbackground=C["border"], highlightthickness=1)
         spin.pack(fill="x", padx=12)
 
-        # Examples
-        tk.Label(sb, text="EXAMPLES", font=("Segoe UI", 8, "bold"),
-                 bg=C["sidebar"], fg=C["muted"]).pack(anchor="w", padx=16, pady=(16, 6))
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=12, pady=8)
 
-        examples = [
-            "Build a FastAPI REST API with CRUD endpoints in Claude Code",
-            "Research React best practices in Chrome, then scaffold a new project in Claude Code",
-            "Create a Python web scraper, test it, and save results",
-            "Build a to-do app with HTML/CSS/JS — full project",
-            "Research the top 5 npm packages for auth, implement one",
-            "Fix all errors in the current Claude Code project",
-            "Build and run a simple Flask app with login page",
-        ]
-        for ex in examples:
-            btn = tk.Label(sb, text=f"  {ex}", bg=C["sidebar"], fg=C["muted"],
-                           font=("Segoe UI", 8), anchor="w", cursor="hand2",
-                           wraplength=200, justify="left")
-            btn.pack(fill="x", padx=8, pady=1)
-            btn.bind("<Button-1>", lambda e, t=ex: self._set_task(t))
-            btn.bind("<Enter>", lambda e, b=btn: b.configure(fg=C["text"]))
-            btn.bind("<Leave>", lambda e, b=btn: b.configure(fg=C["muted"]))
+        # ── Task History ────────────────────────────────────────────────
+        hdr_row = tk.Frame(sb, bg=C["sidebar"])
+        hdr_row.pack(fill="x", padx=16)
+        tk.Label(hdr_row, text="HISTORY", font=("Segoe UI", 8, "bold"),
+                 bg=C["sidebar"], fg=C["muted"]).pack(side="left")
+        refresh_lbl = tk.Label(hdr_row, text="↻", font=("Segoe UI", 10),
+                                bg=C["sidebar"], fg=C["muted"], cursor="hand2")
+        refresh_lbl.pack(side="right")
+        refresh_lbl.bind("<Button-1>", lambda _: self._refresh_history())
+
+        self._history_frame = tk.Frame(sb, bg=C["sidebar"])
+        self._history_frame.pack(fill="x", padx=8, pady=(4, 4))
+        self._refresh_history()
 
     def _build_chat(self, parent):
         tk.Label(parent, text="  AGENT CONVERSATION", font=("Segoe UI", 8, "bold"),
@@ -435,6 +429,87 @@ class GUIOCApp(tk.Tk):
         clr.bind("<Button-1>", lambda _: self._chat.clear())
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _refresh_history(self, _=None):
+        from memory import get_memory
+        mem = get_memory()
+        tasks = mem.recent_tasks(12)
+
+        for w in self._history_frame.winfo_children():
+            w.destroy()
+
+        if not tasks:
+            tk.Label(self._history_frame, text="  No history yet",
+                     bg=C["sidebar"], fg=C["muted"], font=("Segoe UI", 8)).pack(anchor="w")
+            return
+
+        status_icons = {"done": "✓", "failed": "✗", "interrupted": "⚡", "running": "●"}
+
+        for t in tasks:
+            icon  = status_icons.get(t["status"], "?")
+            color = {
+                "done": C["ok"], "failed": C["err"],
+                "interrupted": C["warn"], "running": C["accent2"]
+            }.get(t["status"], C["muted"])
+
+            row = tk.Frame(self._history_frame, bg=C["sidebar"], cursor="hand2")
+            row.pack(fill="x", pady=1)
+
+            tk.Label(row, text=icon, bg=C["sidebar"], fg=color,
+                     font=("Segoe UI", 8, "bold"), width=2).pack(side="left")
+
+            snippet = t["task"][:34] + ("…" if len(t["task"]) > 34 else "")
+            lbl = tk.Label(row, text=snippet, bg=C["sidebar"], fg=C["muted"],
+                           font=("Segoe UI", 8), anchor="w", cursor="hand2")
+            lbl.pack(side="left", fill="x", expand=True)
+
+            # Click to reuse task
+            lbl.bind("<Button-1>", lambda e, task=t["task"]: self._set_task(task))
+            lbl.bind("<Enter>", lambda e, b=lbl: b.configure(fg=C["text"]))
+            lbl.bind("<Leave>", lambda e, b=lbl: b.configure(fg=C["muted"]))
+
+            # Resume button for interrupted tasks
+            if t["status"] == "interrupted":
+                res = tk.Label(row, text="▶", bg=C["sidebar"], fg=C["warn"],
+                               font=("Segoe UI", 8), cursor="hand2")
+                res.pack(side="right", padx=4)
+                res.bind("<Button-1>", lambda e, tid=t["id"], task=t["task"]:
+                          self._resume_task(tid, task))
+
+    def _resume_task(self, task_id: int, task: str):
+        """Resume an interrupted task from saved messages."""
+        if self._agent:
+            self._agent.stop()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+        try:
+            max_iter = int(self._iter_var.get())
+        except ValueError:
+            max_iter = self.max_iter
+
+        from agent import SVIVIOCLAWAgent
+        backend = self._backend_var.get()
+        self._agent = SVIVIOCLAWAgent(
+            api_key=self.api_key,
+            max_iter=max_iter,
+            on_event=on_event,
+            backend=backend,
+            model=self._model_var.get().strip(),
+            openrouter_key=self._key_entry_var.get().strip(),
+            ollama_url=self._ollama_var.get().strip(),
+            resume_task_id=task_id,
+        )
+
+        self._chat.clear()
+        self._set_running(True)
+        self._chat.add_bubble(f"Resuming task #{task_id}: {task}", role="user")
+
+        def run():
+            self._agent.run(task)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
 
     def _on_provider_change(self):
         backend = self._backend_var.get()
@@ -552,9 +627,13 @@ class GUIOCApp(tk.Tk):
         elif event == "warning":
             self._chat.add_bubble(f"⚠ {data['msg']}", role="system")
 
+        elif event == "memory_event":
+            self._chat.add_bubble(f"🧠 {data['msg']}", role="system")
+
         elif event == "done":
             self._set_running(False)
             self._chat.add_bubble(data["text"], role="agent")
+            self._refresh_history()   # update history panel
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

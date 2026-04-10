@@ -13,6 +13,7 @@ from io import BytesIO
 from typing import Optional, Callable
 
 from providers import BaseProvider, AgentResponse, build_provider
+from memory import MemoryManager, get_memory
 
 try:
     import pyautogui
@@ -186,6 +187,8 @@ App locations (Windows 11):
 - Claude Code: taskbar, Start Menu search "Claude", or Desktop shortcut
 - Chrome: taskbar, Start Menu search "Chrome", or Desktop shortcut
 - Terminal: Win+X → Terminal, or search "cmd" in Start Menu
+
+{memory_block}
 """
 
 
@@ -200,15 +203,15 @@ class SVIVIOCLAWAgent:
     def __init__(
         self,
         provider: Optional[BaseProvider] = None,
-        # Legacy single-key path kept for compatibility
         api_key: Optional[str] = None,
         max_iter: int = 200,
         on_event: Optional[Callable[[str, dict], None]] = None,
-        # Provider selection
         backend: str = "anthropic",
         model: str = "",
         openrouter_key: str = "",
         ollama_url: str = "",
+        memory: Optional[MemoryManager] = None,
+        resume_task_id: Optional[int] = None,
     ):
         self.max_iter = max_iter
         self.on_event = on_event or (lambda evt, data: None)
@@ -216,6 +219,9 @@ class SVIVIOCLAWAgent:
         self._messages: list[dict] = []
         self._iter = 0
         self._running = False
+        self._task_id: Optional[int] = None
+        self._mem: MemoryManager = memory or get_memory()
+        self._resume_task_id = resume_task_id
 
         if provider is not None:
             self._provider = provider
@@ -236,13 +242,20 @@ class SVIVIOCLAWAgent:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _system(self) -> str:
-        return SYSTEM_PROMPT.format(screen_w=self.sw, screen_h=self.sh)
+        return SYSTEM_PROMPT.format(
+            screen_w=self.sw,
+            screen_h=self.sh,
+            memory_block=self._mem.context_block(),
+        )
 
     def _emit(self, event: str, **data):
         self.on_event(event, data)
 
     def stop(self):
         self._running = False
+        if self._task_id:
+            self._mem.save_messages(self._task_id, self._messages)
+            self._mem.interrupt_task(self._task_id, self._iter)
 
     # ── Anthropic-specific message building ───────────────────────────────────
 
@@ -257,21 +270,34 @@ class SVIVIOCLAWAgent:
     def run(self, task: str) -> str:
         self._running = True
         self._iter    = 0
-        self._messages = []
 
         logger.info("Task: %s", task)
         self._emit("task_start", task=task)
 
-        # Seed: initial screenshot + task description
-        init_ss = screenshot_b64()
-        self._messages.append({
-            "role": "user",
-            "content": [
-                image_block(init_ss),
-                {"type": "text", "text": f"Complete this task autonomously: {task}"},
-            ],
-        })
-        self._emit("screenshot", data=init_ss)
+        # ── Resume or fresh start ─────────────────────────────────────────
+        if self._resume_task_id:
+            saved = self._mem.load_messages(self._resume_task_id)
+            if saved:
+                self._messages = saved
+                self._task_id  = self._resume_task_id
+                self._mem.finish_task(self._task_id, "", 0, status="running")
+                self._emit("memory_event", msg=f"Resuming task #{self._task_id} with {len(saved)} saved messages.")
+                logger.info("Resuming task_id=%d (%d messages)", self._task_id, len(saved))
+            else:
+                self._resume_task_id = None
+
+        if not self._resume_task_id:
+            self._messages = []
+            self._task_id = self._mem.start_task(task, provider=self._provider.name)
+            init_ss = screenshot_b64()
+            self._messages.append({
+                "role": "user",
+                "content": [
+                    image_block(init_ss),
+                    {"type": "text", "text": f"Complete this task autonomously: {task}"},
+                ],
+            })
+            self._emit("screenshot", data=init_ss)
 
         final_text = "Task ended."
 
@@ -307,26 +333,31 @@ class SVIVIOCLAWAgent:
                 logger.info("Agent: %s", response.text[:120])
                 self._emit("message", text=response.text)
                 final_text = response.text
+                # Extract discoverable facts from the text
+                self._mem.extract_and_learn(response.text, task_id=self._task_id)
 
             # Append assistant turn to history
-            # For Anthropic the raw object is the full response; for others we build it.
             if hasattr(response.raw, "content"):
-                # Anthropic native
                 self._messages.append({"role": "assistant", "content": response.raw.content})
             else:
-                # OpenRouter / Ollama — build a minimal assistant turn
                 self._messages.append({
                     "role": "assistant",
                     "content": response.text or "(no text)"
                 })
 
+            # Checkpoint messages every 10 iterations (for resume)
+            if self._task_id and self._iter % 10 == 0:
+                self._mem.save_messages(self._task_id, self._messages)
+
             # Done?
             if response.done:
+                self._mem.finish_task(self._task_id, final_text, self._iter)
                 self._emit("done", text=final_text)
                 break
 
             # No actions → done
             if not response.actions:
+                self._mem.finish_task(self._task_id, final_text, self._iter)
                 self._emit("done", text=final_text)
                 break
 
@@ -348,19 +379,18 @@ class SVIVIOCLAWAgent:
                 if ss:
                     self._emit("screenshot", data=ss)
 
-                # Anthropic format
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": action_id,
                     "content": result_content,
                 })
 
-            # Append tool results (user turn)
             if tool_results:
                 self._messages.append({"role": "user", "content": tool_results})
 
         if self._iter >= self.max_iter:
             final_text = f"Reached max iterations ({self.max_iter})."
+            self._mem.finish_task(self._task_id, final_text, self._iter, status="failed")
             self._emit("done", text=final_text)
 
         self._running = False
